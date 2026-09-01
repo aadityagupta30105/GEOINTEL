@@ -44,6 +44,14 @@ _VARIATION_SELECTOR_16: Final[str] = chr(0xFE0F)
 _ZERO_WIDTH_JOINER: Final[str] = chr(0x200D)
 
 
+# Non-Python files that also reach a console or a rendered surface. Shell
+# commands embedded in tooling configuration print to operator terminals just
+# as the application does, so they are held to the same policy.
+_TEXT_SUFFIXES: Final[frozenset[str]] = frozenset({
+    ".py", ".json", ".toml", ".cfg", ".ini", ".yml", ".yaml", ".txt", ".sh",
+})
+
+
 def _source_files(root: Path) -> list[Path]:
     """Collect first-party Python sources under ``root``.
 
@@ -61,6 +69,29 @@ def _source_files(root: Path) -> list[Path]:
         path
         for path in root.rglob("*.py")
         if not _EXCLUDED_DIRS & set(path.relative_to(root).parts)
+    )
+
+
+def _text_files(root: Path) -> list[Path]:
+    """Collect every first-party text file subject to the emoji policy.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Repository root.
+
+    Returns
+    -------
+    list of pathlib.Path
+        Source, configuration and manifest files outside the excluded
+        directories.
+    """
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.suffix in _TEXT_SUFFIXES
+        and not _EXCLUDED_DIRS & set(path.relative_to(root).parts)
     )
 
 
@@ -101,6 +132,23 @@ class TestZeroEmojiPolicy:
         violations: list[str] = []
         for path in _source_files(project_root):
             content = path.read_text(encoding="utf-8")
+            for line_number, character in _emoji_positions(content):
+                violations.append(
+                    f"{path.relative_to(project_root)}:{line_number} "
+                    f"U+{ord(character):04X} {unicodedata.name(character, 'UNNAMED')}"
+                )
+        assert not violations, "Emoji policy violations:\n" + "\n".join(violations)
+
+    def test_no_emoji_in_configuration_files(self, project_root: Path) -> None:
+        """Tooling configuration is covered too.
+
+        Devcontainer, CI and packaging files embed shell commands whose output
+        reaches an operator console, so they are held to the same policy as
+        application source.
+        """
+        violations: list[str] = []
+        for path in _text_files(project_root):
+            content = path.read_text(encoding="utf-8", errors="replace")
             for line_number, character in _emoji_positions(content):
                 violations.append(
                     f"{path.relative_to(project_root)}:{line_number} "
