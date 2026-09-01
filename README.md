@@ -1,242 +1,148 @@
-# GeoIntel — Geopolitical Intelligence Pipeline
+# GeoIntel
 
-A modular, end-to-end pipeline for automated geopolitical analysis. Collects bilateral event data from GDELT, constructs directed country interaction graphs, computes network centrality metrics, classifies events with a fine-tunable DistilBERT model, and generates intelligence-style narratives via LLM. Includes an interactive Streamlit dashboard.
+Geopolitical intelligence pipeline. Ingests bilateral event data from GDELT, models international relations as a directed weighted graph, computes network centrality and a polarization index, classifies events with DistilBERT, and generates analytical narratives. Ships with an interactive Streamlit dashboard.
 
----
-
-## System Architecture
-
-```
-GDELT / Mock Data
-       |
-       v
-  [gdelt_collector.py]  — fetch, decode, filter, preprocess
-       |
-       v
-  [graph_builder.py]    — directed weighted graph (NetworkX)
-       |
-       v
-  [graph_builder.py]    — centrality metrics, GGPI, communities
-       |
-       v
-  [event_classifier.py] — DistilBERT event type classifier
-       |
-       v
-  [narrator.py]         — LLM narrative generation (Claude / GPT / offline)
-       |
-       v
-  [app.py]              — Streamlit dashboard + Markdown report
-```
+Runs fully offline: no API keys, no network, no model checkpoint required.
 
 ---
 
-## Features
-
-- GDELT 1.0 ingestion with correct 58-column schema and Latin-1 encoding
-- Directed weighted country interaction graph construction (NetworkX)
-- Network metrics: PageRank, betweenness, eigenvector, in/out-degree, conflict ratio
-- Global Geopolitical Polarization Index (GGPI)
-- Community detection via greedy modularity maximization
-- Monthly / quarterly / annual temporal graph snapshots
-- DistilBERT fine-tuning for 5-class geopolitical event classification
-- LLM narratives: bilateral summaries, country profiles, global executive summary
-- Supports Anthropic Claude, OpenAI GPT, and a deterministic offline fallback
-- Interactive Streamlit dashboard with world map, heatmap, radar chart, bilateral panel
-- Offline operation: mock data generator and rule-based classifier require no external services
-
----
-
-## Technology Stack
-
-| Component | Library / Tool |
-|---|---|
-| Data ingestion | `requests`, `pandas` |
-| Graph analysis | `networkx` |
-| ML classification | `transformers`, `datasets`, `torch` |
-| LLM integration | `anthropic`, `openai` |
-| Dashboard | `streamlit`, `plotly` |
-| Numerics | `numpy` |
-| Serialization | `json`, CSV |
-
-Python 3.9+ required.
-
----
-
-## Project Structure
-
-```
-geointel/
-├── main.py                    # Pipeline orchestrator
-├── data/
-│   └── gdelt_collector.py     # GDELT fetch, mock generator, preprocessor
-├── analysis/
-│   ├── graph_builder.py       # Graph construction and network analysis
-│   ├── event_classifier.py    # DistilBERT event classifier
-│   └── narrator.py            # LLM narrative generator
-├── dashboard/
-│   └── app.py                 # Streamlit dashboard
-├── output/                    # Generated outputs (created at runtime)
-│   ├── events_clean.csv
-│   ├── edges.csv
-│   ├── country_metrics.csv
-│   ├── temporal_metrics.csv
-│   ├── network_stats.json
-│   ├── summaries.json
-│   └── report.md
-└── models/
-    └── event_classifier/      # Saved DistilBERT checkpoint (after training)
-```
-
----
-
-## Installation
+## Install
 
 ```bash
-git clone https://github.com/your-org/geointel.git
-cd geointel
-
 python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
-
+venv\Scripts\activate          # Linux/macOS: source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Minimum requirements (`requirements.txt`):**
+Python 3.10 or later.
 
+---
+
+## Quick start
+
+```bash
+python main.py
 ```
-pandas
-numpy
-networkx
-requests
-streamlit
-plotly
-torch
-transformers
-datasets
-scikit-learn
-anthropic        # optional — for Claude narratives
-openai           # optional — for GPT narratives
+
+Generates synthetic events, builds the graph, and writes all artefacts to `output/`.
+
+Then launch the dashboard:
+
+```bash
+python main.py --dashboard
+```
+
+Open http://localhost:8501.
+
+> If `streamlit run dashboard/app.py` reports "command not found", the console script is not on your PATH. Use `python main.py --dashboard`, or `python -m streamlit run dashboard/app.py`. Make sure the virtual environment is activated first, or call the interpreter directly: `venv\Scripts\python.exe main.py --dashboard`.
+
+---
+
+## Usage
+
+```bash
+python main.py [options]
+```
+
+| Option | Description |
+|---|---|
+| `--source {mock,gdelt}` | Event source. Default `mock`. |
+| `--start`, `--end` | Window as `YYYY-MM-DD`. Default: last 90 days. |
+| `--events N` | Synthetic event count. Default 5000. |
+| `--seed N` | Seed the generator for reproducible runs. |
+| `--classify` | Run ML event classification. |
+| `--llm` | Generate narratives. |
+| `--llm-provider {auto,anthropic,openai,offline}` | Narrative provider. Default `auto`. |
+| `--bilateral A B` | Analyse a country pair, e.g. `--bilateral USA CHN`. |
+| `--temporal {month,quarter,year}` | Snapshot granularity. Default `month`. |
+| `--output DIR` | Output directory. Default `output`. |
+| `--dashboard` | Launch the dashboard and exit. |
+
+Examples:
+
+```bash
+python main.py --source gdelt --start 2024-01-01 --end 2024-03-31
+python main.py --classify --llm --bilateral USA CHN
+python main.py --events 10000 --seed 42
 ```
 
 ---
 
 ## Configuration
 
-API keys are read from environment variables. Neither key is required; the system falls back to offline operation automatically.
+Narratives use Anthropic if `ANTHROPIC_API_KEY` is set, then OpenAI if `OPENAI_API_KEY` is set, otherwise a deterministic offline generator. Neither key is required.
 
 ```bash
-# Anthropic Claude (preferred)
-export ANTHROPIC_API_KEY="sk-ant-..."
-
-# OpenAI GPT (fallback)
-export OPENAI_API_KEY="sk-..."
+set ANTHROPIC_API_KEY=sk-ant-...      # Linux/macOS: export
 ```
-
-On Windows use `set` instead of `export`.
 
 ---
 
-## Usage
+## Output
 
-### Running the Pipeline
-
-**Quick start with mock data (no API keys, no network):**
-```bash
-python main.py
-```
-
-**GDELT live data, specific date range:**
-```bash
-python main.py --source gdelt --start 2024-01-01 --end 2024-03-31
-```
-
-**Mock data with LLM narratives:**
-```bash
-python main.py --llm --llm-provider anthropic
-```
-
-**Bilateral analysis between two countries:**
-```bash
-python main.py --bilateral USA CHN --llm
-```
-
-**Temporal granularity:**
-```bash
-python main.py --temporal quarter
-```
-
-**Full example with all options:**
-```bash
-python main.py \
-  --source gdelt \
-  --start 2024-01-01 \
-  --end 2024-06-30 \
-  --llm \
-  --llm-provider anthropic \
-  --bilateral RUS UKR \
-  --temporal month \
-  --output ./output
-```
-
-### Running the Dashboard
-
-```bash
-streamlit run dashboard/app.py
-# Open http://localhost:8501
-```
-
-Or via the pipeline flag (after running the pipeline first):
-```bash
-python main.py --dashboard
-```
-
-The dashboard reads pre-computed data from `output/events_clean.csv` by default, or can fetch live GDELT data or generate mock data directly.
-
----
-
-## Example Commands
-
-| Goal | Command |
+| File | Contents |
 |---|---|
-| Run offline pipeline, 5000 events | `python main.py` |
-| Run with 10,000 mock events | `python main.py --events 10000` |
-| Use GDELT, last 30 days | `python main.py --source gdelt --start $(date -d '30 days ago' +%F) --end $(date +%F)` |
-| Generate LLM summaries offline | `python main.py --llm --llm-provider offline` |
-| Analyze USA-CHN bilateral | `python main.py --bilateral USA CHN --llm` |
-| Train event classifier | `python -c "from analysis.event_classifier import *; c = GeopoliticalEventClassifier(); c.load_tokenizer_model(); c.train()"` |
-| Launch dashboard only | `streamlit run dashboard/app.py` |
+| `events_clean.csv` | Preprocessed bilateral events |
+| `edges.csv` | Graph edge list with weights, tone, event counts |
+| `country_metrics.csv` | PageRank, betweenness, eigenvector, conflict ratio |
+| `temporal_metrics.csv` | Per-period network statistics |
+| `network_stats.json` | Global statistics including GGPI |
+| `summaries.json` | Generated narratives |
+| `report.md` | Markdown intelligence report |
 
 ---
 
-## Output Files
+## GGPI
 
-| File | Description |
-|---|---|
-| `output/events_clean.csv` | Preprocessed bilateral event records |
-| `output/edges.csv` | Graph edge list with weights and attributes |
-| `output/country_metrics.csv` | Per-country centrality metrics |
-| `output/temporal_metrics.csv` | Time-series network statistics |
-| `output/network_stats.json` | Global network statistics including GGPI |
-| `output/summaries.json` | LLM-generated country profiles and narratives |
-| `output/report.md` | Formatted Markdown intelligence report |
-| `models/event_classifier/` | Saved DistilBERT checkpoint and label map |
+The Global Geopolitical Polarization Index scores network fragmentation on `[0, 1]`:
+
+```
+GGPI = 0.40 * modularity
+     + 0.40 * negative_edge_ratio
+     + 0.20 * max(0, -avg_tone)
+```
 
 ---
 
-## Future Improvements
+## Structure
 
-- GDELT 2.0 and GKG integration for full article text
-- ICEWS labeled data for classifier training
-- Graph attention network (GAT) for dynamic influence modeling
-- Empirical GGPI coefficient calibration against historical datasets
-- REST API endpoint for programmatic access
-- Docker container for one-command deployment
-- Multi-language news source integration
+```
+main.py                     Pipeline orchestrator (CLI)
+smoke_test.py               End-to-end operational check
+utils/logging_config.py     ASCII-safe console logging
+data/gdelt_collector.py     GDELT fetch, synthetic generator, preprocessing
+analysis/graph_builder.py   Graph construction, centralities, GGPI
+analysis/narrator.py        Narrative generation
+models/event_classifier.py  DistilBERT classifier and keyword fallback
+dashboard/app.py            Streamlit shell: data, caching, layout
+dashboard/theme.py          Palette, typography, Plotly defaults
+dashboard/geodata.py        Country centroids and GDP (PPP)
+dashboard/blocs.py          Bloc affinity scoring
+dashboard/figures.py        Plotly figure builders
+tests/                      pytest suite
+```
+
+---
+
+## Testing
+
+```bash
+pytest              # unit and contract tests
+python smoke_test.py   # end-to-end operational check
+```
+
+Both run offline. `tests/test_standards.py` enforces the project conventions: no emoji in source or output, full type annotations, documented public definitions.
+
+---
+
+## Notes
+
+- GDELT 1.0 exports are Latin-1 encoded with a 58-column schema; `Actor2CountryCode` is at index 17. A truncated column list silently yields zero bilateral events.
+- The ML stack (`torch`, `transformers`) is optional. Without it, classification falls back to keyword matching.
+- `matplotlib` is deliberately not a dependency; table shading is rendered from the platform palette.
 
 ---
 
 ## License
 
-MIT License. See `LICENSE` for details.
-
-GDELT data is provided by the GDELT Project under their own terms of use. See [gdeltproject.org](https://www.gdeltproject.org/) for details.
+MIT. GDELT data is provided by [The GDELT Project](https://www.gdeltproject.org/) under its own terms.

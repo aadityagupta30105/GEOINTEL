@@ -1,28 +1,33 @@
-# Core
+# --- Core -------------------------------------------------------------------
 pandas>=2.0.0
 numpy>=1.24.0
 requests>=2.31.0
 
-# Graph analysis
+# --- Graph analysis ---------------------------------------------------------
 networkx>=3.1
 
-# ML & NLP
+# --- Machine learning and NLP ----------------------------------------------
+# Required only for the fine-tuned event classifier. The platform imports and
+# runs without them, degrading to the deterministic keyword classifier.
 torch>=2.0.0
 transformers>=4.35.0
 datasets>=2.14.0
 scikit-learn>=1.3.0
 
-# Dashboard & Visualization
+# --- Dashboard and visualisation -------------------------------------------
+# Table shading uses the platform palette directly, so matplotlib is
+# deliberately not a dependency.
 streamlit>=1.28.0
 plotly>=5.17.0
 
-# LLM clients (install the one you use)
+# --- LLM clients ------------------------------------------------------------
+# Optional. Absent credentials or packages fall back to the offline narrator.
 anthropic>=0.20.0
 openai>=1.10.0
 
-# Optional: faster community detection
-python-louvain>=0.16
-
-# Utilities
+# --- Utilities --------------------------------------------------------------
 tqdm>=4.65.0
 python-dotenv>=1.0.0
+
+# --- Development ------------------------------------------------------------
+pytest>=8.0.0
