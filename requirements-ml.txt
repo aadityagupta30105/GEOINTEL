@@ -1,0 +1,12 @@
+# Event classification extras.
+#
+# Required only to train or run the fine-tuned DistilBERT classifier. Without
+# these, models.event_classifier imports normally and classification falls back
+# to deterministic keyword matching.
+#
+#   pip install -r requirements.txt -r requirements-ml.txt
+
+torch>=2.0.0
+transformers>=4.35.0
+datasets>=2.14.0
+scikit-learn>=1.3.0

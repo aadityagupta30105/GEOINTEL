@@ -16,6 +16,15 @@ pip install -r requirements.txt
 
 Python 3.10 or later.
 
+Optional extras:
+
+```bash
+pip install -r requirements-ml.txt     # DistilBERT event classification
+pip install -r requirements-dev.txt    # pytest
+```
+
+Without `requirements-ml.txt`, classification falls back to keyword matching; nothing else changes.
+
 ---
 
 ## Quick start
@@ -135,10 +144,22 @@ Both run offline. `tests/test_standards.py` enforces the project conventions: no
 
 ---
 
+## Deploy
+
+The dashboard runs on Streamlit Community Cloud with no configuration. Point it at:
+
+```
+https://github.com/aadityagupta30105/GEOINTEL/blob/main/dashboard/app.py
+```
+
+`output/` is not committed, so a hosted instance starts on synthetic data. Switch sources in the sidebar. To serve real GDELT data, either select "GDELT live fetch" or commit an `output/events_clean.csv` produced by `main.py`.
+
+---
+
 ## Notes
 
 - GDELT 1.0 exports are Latin-1 encoded with a 58-column schema; `Actor2CountryCode` is at index 17. A truncated column list silently yields zero bilateral events.
-- The ML stack (`torch`, `transformers`) is optional. Without it, classification falls back to keyword matching.
+- The ML stack (`torch`, `transformers`) is kept out of `requirements.txt` so the dashboard deploys within hosted size limits. Install `requirements-ml.txt` for classification.
 - `matplotlib` is deliberately not a dependency; table shading is rendered from the platform palette.
 
 ---

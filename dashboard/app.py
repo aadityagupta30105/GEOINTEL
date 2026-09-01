@@ -372,11 +372,18 @@ def render_sidebar() -> tuple[pd.DataFrame, str, str, bool]:
     with st.sidebar:
         section_title("Data source")
 
+        # Prefer the pipeline export, but only when it exists. On a hosted
+        # deployment the output directory is not committed, so defaulting to
+        # it would halt the app on first load; synthetic data keeps the
+        # dashboard usable with no prior pipeline run.
+        source_options = ["pipeline_output", "gdelt_live", "mock"]
+        default_source = "pipeline_output" if EVENTS_CSV.exists() else "mock"
+
         source = st.radio(
             "Source",
-            options=["pipeline_output", "gdelt_live", "mock"],
+            options=source_options,
             format_func=lambda key: _SOURCE_LABELS[key],
-            index=0,
+            index=source_options.index(default_source),
             label_visibility="collapsed",
             help="The pipeline export reads output/events_clean.csv written by main.py",
             key="source",

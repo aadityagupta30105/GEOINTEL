@@ -1,18 +1,25 @@
+# Runtime dependencies.
+#
+# This is the deployment manifest: it installs what the pipeline and the
+# dashboard need to run. The machine-learning stack is deliberately excluded
+# because the dashboard never loads it and hosted environments cap install
+# size; event classification degrades to the keyword classifier without it.
+#
+#   Event classification : pip install -r requirements-ml.txt
+#   Development          : pip install -r requirements-dev.txt
+
 # --- Core -------------------------------------------------------------------
 pandas>=2.0.0
 numpy>=1.24.0
 requests>=2.31.0
 
 # --- Graph analysis ---------------------------------------------------------
+# scipy is a hard requirement, not an optional accelerator: networkx implements
+# pagerank and the dense eigenvector solver on scipy sparse matrices. It is
+# declared explicitly rather than inherited from scikit-learn, which is not
+# installed in the runtime manifest.
 networkx>=3.1
-
-# --- Machine learning and NLP ----------------------------------------------
-# Required only for the fine-tuned event classifier. The platform imports and
-# runs without them, degrading to the deterministic keyword classifier.
-torch>=2.0.0
-transformers>=4.35.0
-datasets>=2.14.0
-scikit-learn>=1.3.0
+scipy>=1.10.0
 
 # --- Dashboard and visualisation -------------------------------------------
 # Table shading uses the platform palette directly, so matplotlib is
@@ -21,13 +28,11 @@ streamlit>=1.28.0
 plotly>=5.17.0
 
 # --- LLM clients ------------------------------------------------------------
-# Optional. Absent credentials or packages fall back to the offline narrator.
+# Optional at runtime. Absent credentials or packages fall back to the
+# deterministic offline narrator.
 anthropic>=0.20.0
 openai>=1.10.0
 
 # --- Utilities --------------------------------------------------------------
 tqdm>=4.65.0
 python-dotenv>=1.0.0
-
-# --- Development ------------------------------------------------------------
-pytest>=8.0.0
