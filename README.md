@@ -10,17 +10,15 @@ Runs fully offline: no API keys, no network, no model checkpoint required.
 
 ```bash
 python -m venv venv
-venv\Scripts\activate          # Linux/macOS: source venv/bin/activate
+venv\Scripts\activate          
 pip install -r requirements.txt
 ```
-
-Python 3.10 or later.
 
 Optional extras:
 
 ```bash
-pip install -r requirements-ml.txt     # DistilBERT event classification
-pip install -r requirements-dev.txt    # pytest
+pip install -r requirements-ml.txt     
+pip install -r requirements-dev.txt    
 ```
 
 Without `requirements-ml.txt`, classification falls back to keyword matching; nothing else changes.
@@ -40,10 +38,6 @@ Then launch the dashboard:
 ```bash
 python main.py --dashboard
 ```
-
-Open http://localhost:8501.
-
-> If `streamlit run dashboard/app.py` reports "command not found", the console script is not on your PATH. Use `python main.py --dashboard`, or `python -m streamlit run dashboard/app.py`. Make sure the virtual environment is activated first, or call the interpreter directly: `venv\Scripts\python.exe main.py --dashboard`.
 
 ---
 
@@ -73,16 +67,6 @@ Examples:
 python main.py --source gdelt --start 2024-01-01 --end 2024-03-31
 python main.py --classify --llm --bilateral USA CHN
 python main.py --events 10000 --seed 42
-```
-
----
-
-## Configuration
-
-Narratives use Anthropic if `ANTHROPIC_API_KEY` is set, then OpenAI if `OPENAI_API_KEY` is set, otherwise a deterministic offline generator. Neither key is required.
-
-```bash
-set ANTHROPIC_API_KEY=sk-ant-...      # Linux/macOS: export
 ```
 
 ---
@@ -144,17 +128,6 @@ Both run offline. `tests/test_standards.py` enforces the project conventions: no
 
 ---
 
-## Deploy
-
-The dashboard runs on Streamlit Community Cloud with no configuration. Point it at:
-
-```
-https://github.com/aadityagupta30105/GEOINTEL/blob/main/dashboard/app.py
-```
-
-`output/` is not committed, so a hosted instance starts on synthetic data. Switch sources in the sidebar. To serve real GDELT data, either select "GDELT live fetch" or commit an `output/events_clean.csv` produced by `main.py`.
-
----
 
 ## Notes
 
