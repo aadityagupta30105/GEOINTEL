@@ -283,6 +283,80 @@ class SmokeTest:
             )
         return f"{len(snapshots)} snapshots partition the stream"
 
+    def check_store_round_trip(self) -> str:
+        """Store the event stream and rebuild the graph from SQL.
+
+        The store's whole justification is that a graph built from a database
+        window equals one built from the event frame. That equivalence is the
+        thing worth checking operationally, so it is asserted edge by edge
+        rather than by comparing counts.
+
+        Returns
+        -------
+        str
+            Row and edge counts.
+        """
+        from analysis.graph_builder import build_graph, build_graph_from_aggregates
+        from data.store import EventStore
+
+        expected = build_graph(self._events)
+
+        with EventStore(self.workdir / "smoke.db") as store:
+            inserted = store.upsert_events(self._events)
+            if inserted != len(self._events):
+                raise AssertionError(
+                    f"stored {inserted} rows, expected {len(self._events)}"
+                )
+            if store.upsert_events(self._events) != 0:
+                raise AssertionError("re-inserting the same events was not idempotent")
+
+            actual = build_graph_from_aggregates(store.dyad_aggregates())
+            stats = store.stats()
+
+        if set(actual.edges()) != set(expected.edges()):
+            raise AssertionError("graph from the store differs from the in-memory graph")
+
+        for source, target, data in expected.edges(data=True):
+            if actual[source][target]["event_types"] != data["event_types"]:
+                raise AssertionError(f"event histogram differs on {source}->{target}")
+
+        return (
+            f"{stats['events']:,} rows, {stats['dyad_rows']:,} rollup rows, "
+            f"{actual.number_of_edges():,} edges reproduced"
+        )
+
+    def check_harvest_is_resumable(self) -> str:
+        """Fill a window offline, then confirm a rerun collects nothing.
+
+        Resumability is what makes a year-long collection survivable, and it
+        is invisible until a second run is attempted.
+
+        Returns
+        -------
+        str
+            Days held and the pending count on rerun.
+        """
+        from data.harvest import day_range, harvest_mock, pending_days
+        from data.store import EventStore
+
+        start, end = datetime(2024, 1, 1), datetime(2024, 2, 15)
+
+        with EventStore(self.workdir / "harvest.db") as store:
+            report = harvest_mock(store, start, end, events_per_day=10)
+            days = day_range(start, end)
+            outstanding = pending_days(store, days)
+
+            if report.requested != len(days):
+                raise AssertionError(
+                    f"requested {report.requested} days, expected {len(days)}"
+                )
+            if outstanding:
+                raise AssertionError(f"{len(outstanding)} day(s) still pending")
+            if store.dyad_aggregates().empty:
+                raise AssertionError("rollup was not built")
+
+        return f"{len(days)} days held, 0 pending on rerun"
+
     def check_classifier_fallback(self) -> str:
         """Classify events without a checkpoint.
 
@@ -557,6 +631,8 @@ def main(argv: list[str] | None = None) -> int:
         ("Graph analytics and GGPI", suite.check_graph_analytics),
         ("Degenerate graph handling", suite.check_degenerate_graphs),
         ("Temporal slicing", suite.check_temporal_slicing),
+        ("Store round trip", suite.check_store_round_trip),
+        ("Harvest is resumable", suite.check_harvest_is_resumable),
         ("Classifier fallback", suite.check_classifier_fallback),
         ("Offline narrative generation", suite.check_narrator_offline),
         ("Dashboard figure builders", suite.check_figures),

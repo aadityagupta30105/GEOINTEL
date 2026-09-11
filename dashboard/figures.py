@@ -20,15 +20,21 @@ from dashboard.geodata import COUNTRY_GEO, format_gdp, marker_size
 from dashboard.theme import (
     ACCENT,
     ACCENT_ALT,
+    BACKGROUND,
     BLOC_COLORS,
     BORDER,
+    FIGURE_DISPLAY_FONT,
+    FIGURE_LABEL_FONT,
     MUTED,
     NEGATIVE,
+    NODE_COLORSCALE,
+    NODE_CONFLICT_COLORSCALE,
     POSITIVE,
     SURFACE,
     TEXT,
     apply_chart_layout,
     apply_geo_layout,
+    overlay,
     rgba,
 )
 
@@ -255,19 +261,23 @@ def build_network_figure(
             "size": sizes,
             "sizemode": "diameter",
             "color": colors,
-            "colorscale": "RdYlGn_r" if color_by == "Conflict Ratio" else "Viridis",
+            "colorscale": (
+                NODE_CONFLICT_COLORSCALE
+                if color_by == "Conflict Ratio"
+                else NODE_COLORSCALE
+            ),
             "showscale": True,
             "colorbar": {
                 "title": {"text": color_by, "font": {"color": TEXT, "size": 11}},
                 "thickness": 10,
                 "len": 0.45,
                 "tickfont": {"color": MUTED, "size": 9},
-                "bgcolor": "rgba(17,24,39,0.80)",
+                "bgcolor": overlay(SURFACE, 0.80),
                 "bordercolor": BORDER,
                 "outlinecolor": BORDER,
             },
             "opacity": 0.92,
-            "line": {"width": 1.2, "color": "#0f172a"},
+            "line": {"width": 1.2, "color": BACKGROUND},
         },
         showlegend=False,
     ))
@@ -437,10 +447,10 @@ def build_radar_chart(metrics_df: pd.DataFrame, country: str) -> go.Figure:
         },
         height=300,
         paper_bgcolor="rgba(0,0,0,0)",
-        font={"color": TEXT, "family": "Space Mono, monospace"},
+        font={"color": TEXT, "family": FIGURE_LABEL_FONT},
         title={
             "text": f"{country} influence profile",
-            "font": {"color": ACCENT, "family": "Syne, sans-serif", "size": 13},
+            "font": {"color": ACCENT, "family": FIGURE_DISPLAY_FONT, "size": 13},
             "x": 0, "xanchor": "left",
         },
         margin={"l": 40, "r": 40, "t": 46, "b": 24},

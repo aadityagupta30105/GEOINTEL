@@ -8,6 +8,8 @@ that a regression fails the suite rather than reaching an operator console.
 from __future__ import annotations
 
 import ast
+import re
+import tomllib
 import unicodedata
 from pathlib import Path
 from typing import Final
@@ -218,6 +220,8 @@ class TestTypeAnnotations:
         [
             "utils/logging_config.py",
             "data/gdelt_collector.py",
+            "data/store.py",
+            "data/harvest.py",
             "analysis/graph_builder.py",
             "analysis/narrator.py",
             "models/event_classifier.py",
@@ -249,6 +253,8 @@ class TestTypeAnnotations:
         [
             "utils/logging_config.py",
             "data/gdelt_collector.py",
+            "data/store.py",
+            "data/harvest.py",
             "analysis/graph_builder.py",
             "analysis/narrator.py",
             "models/event_classifier.py",
@@ -289,6 +295,8 @@ class TestDocumentation:
         [
             "utils/logging_config.py",
             "data/gdelt_collector.py",
+            "data/store.py",
+            "data/harvest.py",
             "analysis/graph_builder.py",
             "analysis/narrator.py",
             "models/event_classifier.py",
@@ -327,17 +335,17 @@ class TestDocumentation:
 
 
 class TestPalette:
-    """The dashboard uses the specified enterprise palette."""
+    """The dashboard uses the Lamborghini black-and-gold palette."""
 
     def test_core_colors(self) -> None:
         from dashboard import theme
 
-        assert theme.BACKGROUND == "#0a0e1a"
-        assert theme.SURFACE == "#111827"
-        assert theme.ACCENT == "#00d4ff"
-        assert theme.ACCENT_ALT == "#ff6b35"
-        assert theme.POSITIVE == "#22c55e"
-        assert theme.NEGATIVE == "#ef4444"
+        assert theme.BACKGROUND == "#000000"
+        assert theme.SURFACE == "#0b0b0b"
+        assert theme.ACCENT == "#c9a227"
+        assert theme.ACCENT_ALT == "#ffce00"
+        assert theme.POSITIVE == "#3fbf7f"
+        assert theme.NEGATIVE == "#d92b2b"
 
     def test_tone_color_mapping(self) -> None:
         from dashboard import theme
@@ -351,3 +359,45 @@ class TestPalette:
 
         for variable in ("--bg", "--surface", "--accent", "--positive", "--negative"):
             assert variable in theme.GLOBAL_CSS
+
+    def test_stylesheet_carries_no_literal_colours(self) -> None:
+        """Every colour in the stylesheet must come from the palette.
+
+        The stylesheet is generated from the module constants, so a literal
+        hex in the CSS is a value that a palette change would silently leave
+        behind.
+        """
+        from dashboard import theme
+
+        palette = {
+            value.lower()
+            for name, value in vars(theme).items()
+            if isinstance(value, str) and value.startswith("#") and name.isupper()
+        }
+        literals = {
+            match.group(0).lower()
+            for match in re.finditer(r"#[0-9a-fA-F]{6}", theme.GLOBAL_CSS)
+        }
+        assert not literals - palette, (
+            f"Stylesheet colours outside the palette: {sorted(literals - palette)}"
+        )
+
+    def test_streamlit_config_matches_the_palette(self, project_root: Path) -> None:
+        """Streamlit's own chrome is configured from the same colours.
+
+        The stylesheet cannot reach the toolbar, spinners or the widget
+        defaults Streamlit paints before it loads. Those come from
+        .streamlit/config.toml, and a drift between the two shows as a flash
+        of the wrong colour on every rerun.
+        """
+        from dashboard import theme
+
+        config = project_root / ".streamlit" / "config.toml"
+        assert config.exists(), "Missing .streamlit/config.toml"
+
+        settings = tomllib.loads(config.read_text(encoding="utf-8"))["theme"]
+        assert settings["primaryColor"] == theme.ACCENT
+        assert settings["backgroundColor"] == theme.BACKGROUND
+        assert settings["secondaryBackgroundColor"] == theme.SURFACE
+        assert settings["textColor"] == theme.TEXT
+        assert settings["base"] == "dark"

@@ -66,6 +66,7 @@ from data.gdelt_collector import (  # noqa: E402
     generate_mock_data,
     preprocess,
 )
+from data.store import DEFAULT_DB_PATH, EventStore  # noqa: E402
 from utils.logging_config import (  # noqa: E402
     ARROW,
     ERROR,
@@ -124,8 +125,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="geointel",
         description="Geopolitical Intelligence Pipeline",
     )
-    parser.add_argument("--source", choices=["gdelt", "mock"], default="mock",
-                        help="Event data source")
+    parser.add_argument("--source", choices=["gdelt", "mock", "store"], default="mock",
+                        help="Event data source. 'store' reads the event store")
+    parser.add_argument("--db", default=str(DEFAULT_DB_PATH),
+                        help="Event store path, used by --source store and --save-store")
+    parser.add_argument("--save-store", action="store_true",
+                        help="Also write the collected events into the event store")
+    parser.add_argument("--max-rows", type=int, default=2_000_000,
+                        help="Row cap when reading from the store")
     parser.add_argument("--start", default=None,
                         help="Start date YYYY-MM-DD (default: 90 days before end)")
     parser.add_argument("--end", default=None,
@@ -226,6 +233,93 @@ def resolve_window(start: str | None, end: str | None) -> tuple[datetime, dateti
     return start_dt, end_dt
 
 
+def read_from_store(
+    db_path: str | Path,
+    start: datetime,
+    end: datetime,
+    max_rows: int,
+) -> pd.DataFrame:
+    """Read a window of stored events for analysis.
+
+    Materialising events is the expensive way to use the store, and the
+    pipeline needs it: the CSV export and the report are both event-level. The
+    row cap guards against a wide window quietly pulling millions of rows into
+    memory, and truncation is reported rather than silent.
+
+    Parameters
+    ----------
+    db_path : str or pathlib.Path
+        Store path.
+    start, end : datetime
+        Inclusive window bounds.
+    max_rows : int
+        Row cap.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Stored events, empty when the store is absent or the window matched
+        nothing.
+    """
+    if not Path(db_path).exists():
+        _log.error("%s No event store at %s", ERROR, db_path)
+        _log.error("   Create one with: python -m data.harvest --year")
+        return pd.DataFrame()
+
+    window = (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+
+    with EventStore(db_path, read_only=True) as store:
+        held = store.stats()
+        _log.info(
+            "Store    : %s events, %s to %s",
+            f"{held['events']:,}", held["first_date"], held["last_date"],
+        )
+        matching = store.count_events(start=window[0], end=window[1])
+        events = store.events(start=window[0], end=window[1], limit=max_rows)
+
+    if matching > max_rows:
+        # The read is thinned across the window rather than truncated, so the
+        # analysis still covers the requested dates. Record that on the frame:
+        # the report renders it, so a capped run cannot produce an artefact
+        # that reads as a complete census of the window.
+        events.attrs["sampled_from"] = matching
+        events.attrs["window"] = window
+        _log.warning(
+            "%s Window holds %s events, above the %s row cap %s thinned to a "
+            "%.1f%% sample spanning the full window",
+            WARN, f"{matching:,}", f"{max_rows:,}", ARROW,
+            100.0 * len(events) / matching,
+        )
+        _log.warning("   Raise --max-rows for a complete read.")
+
+    _log.info("%s Read %s events from the store", OK, f"{len(events):,}")
+    return events
+
+
+def save_to_store(db_path: str | Path, events: pd.DataFrame) -> int:
+    """Persist a run's events into the event store.
+
+    Parameters
+    ----------
+    db_path : str or pathlib.Path
+        Store path, created when absent.
+    events : pandas.DataFrame
+        Preprocessed events.
+
+    Returns
+    -------
+    int
+        Rows newly inserted. Zero when every row was already held.
+    """
+    with EventStore(db_path) as store:
+        inserted = store.upsert_events(events)
+    _log.info(
+        "%s Store updated: %s new row(s) of %s (%s)",
+        OK, f"{inserted:,}", f"{len(events):,}", db_path,
+    )
+    return inserted
+
+
 def run_pipeline(args: argparse.Namespace) -> PipelineResult | None:
     """Execute the full analysis pipeline.
 
@@ -256,14 +350,26 @@ def run_pipeline(args: argparse.Namespace) -> PipelineResult | None:
 
     # --- Stage 1: collection ------------------------------------------------
     print(section("Stage 1: data collection"))
-    if args.source == "gdelt":
-        raw_events = collect_gdelt_range(start, end)
+    if args.source == "store":
+        # Reading from the store skips preprocessing: rows were normalised on
+        # the way in, so a rerun over a stored window costs a query and no
+        # network access at all.
+        events = read_from_store(args.db, start, end, args.max_rows)
+        print(section("Stage 2: preprocessing skipped (store rows are normalised)"))
     else:
-        raw_events = generate_mock_data(start, end, n_events=args.events, seed=args.seed)
+        if args.source == "gdelt":
+            raw_events = collect_gdelt_range(start, end)
+        else:
+            raw_events = generate_mock_data(
+                start, end, n_events=args.events, seed=args.seed
+            )
 
-    # --- Stage 2: preprocessing --------------------------------------------
-    print(section("Stage 2: preprocessing"))
-    events = preprocess(raw_events)
+        # --- Stage 2: preprocessing ----------------------------------------
+        print(section("Stage 2: preprocessing"))
+        events = preprocess(raw_events)
+
+        if args.save_store and not events.empty:
+            save_to_store(args.db, events)
 
     if events.empty:
         _log.error("%s Preprocessing returned zero valid events.", ERROR)
@@ -483,6 +589,36 @@ def generate_narratives(
     return summaries
 
 
+def _sampling_note(events: pd.DataFrame) -> list[str]:
+    """Render the provenance line for a capped read, if there was one.
+
+    A report drawn from a thinned sample must say so. Without this the
+    document states an event count and a date range that read as a complete
+    census of the window, and nothing in the artefact contradicts that.
+
+    Parameters
+    ----------
+    events : pandas.DataFrame
+        Event frame, possibly carrying ``sampled_from`` in
+        :attr:`pandas.DataFrame.attrs`.
+
+    Returns
+    -------
+    list of str
+        One Markdown line when the frame was sampled, otherwise empty.
+    """
+    population = events.attrs.get("sampled_from")
+    if not population:
+        return []
+
+    share = 100.0 * len(events) / population
+    return [
+        f"- **Sampling**: {share:.1f}% sample of {population:,} events "
+        f"spanning the full window. Counts below are scaled accordingly; "
+        f"rates and rankings are not. Raise `--max-rows` for a complete read."
+    ]
+
+
 def generate_report(
     events: pd.DataFrame,
     metrics: pd.DataFrame,
@@ -515,6 +651,7 @@ def generate_report(
         f"- **Total events**: {len(events):,}",
         f"- **Countries**: {events['Actor1CountryCode'].nunique()}",
         f"- **Date range**: {events['date'].min()} to {events['date'].max()}",
+        *_sampling_note(events),
         "",
         "## Network Statistics",
         "| Metric | Value |",

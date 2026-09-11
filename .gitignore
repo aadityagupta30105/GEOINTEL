@@ -6,6 +6,11 @@ env/
 # Generated pipeline artefacts
 output/
 
+# Event store. Rebuild with: python -m data.harvest --year
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
 # Trained model checkpoints
 models/artifacts/
 

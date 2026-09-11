@@ -33,8 +33,12 @@ __all__ = [
     "NetworkStats",
     "BilateralSummary",
     "METRIC_COLUMNS",
+    "AGGREGATE_COLUMNS",
+    "aggregate_events",
     "build_graph",
+    "build_graph_from_aggregates",
     "build_temporal_graphs",
+    "build_temporal_graphs_from_aggregates",
     "get_undirected",
     "compute_metrics",
     "compute_network_stats",
@@ -73,6 +77,21 @@ METRIC_COLUMNS: Final[tuple[str, ...]] = (
     "avg_in_tone",
     "conflict_ratio",
     "total_events",
+)
+
+# The intermediate representation between the event stream and the graph: one
+# row per directed dyad and event type. Both the in-memory path
+# (:func:`aggregate_events`) and the SQL path
+# (:meth:`data.store.EventStore.dyad_aggregates`) produce exactly these
+# columns, so a graph built from a database window is identical to one built
+# from the equivalent event frame.
+AGGREGATE_COLUMNS: Final[tuple[str, ...]] = (
+    "Actor1CountryCode",
+    "Actor2CountryCode",
+    "event_type",
+    "num_events",
+    "tone_sum",
+    "mentions",
 )
 
 
@@ -157,12 +176,13 @@ def _edge_weight(
     return float(mentions)
 
 
-def build_graph(df: pd.DataFrame, weight_by: WeightScheme = "frequency") -> nx.DiGraph:
-    """Build a directed weighted graph from preprocessed event data.
+def aggregate_events(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce an event frame to the directed dyad and event-type aggregate.
 
-    Aggregation is fully vectorised: events are grouped by directed dyad and
-    event type rather than iterated row by row, which keeps construction cost
-    proportional to the number of dyads rather than the number of events.
+    This is the in-memory counterpart of
+    :meth:`data.store.EventStore.dyad_aggregates`, which computes the same
+    reduction in SQL. Keeping both behind one column contract means the graph
+    layer never learns where its input came from.
 
     Parameters
     ----------
@@ -170,6 +190,47 @@ def build_graph(df: pd.DataFrame, weight_by: WeightScheme = "frequency") -> nx.D
         Preprocessed events carrying ``Actor1CountryCode``,
         ``Actor2CountryCode``, ``tone_norm``, ``event_type`` and
         ``NumMentions``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns :data:`AGGREGATE_COLUMNS`, one row per dyad and event type.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=list(AGGREGATE_COLUMNS))
+
+    keys = ["Actor1CountryCode", "Actor2CountryCode", "event_type"]
+
+    working = df[keys + ["tone_norm"]].copy()
+    working["mentions"] = (
+        pd.to_numeric(df["NumMentions"], errors="coerce").fillna(1).astype("int64")
+    )
+
+    return (
+        working.groupby(keys, sort=False)
+        .agg(
+            num_events=("tone_norm", "size"),
+            tone_sum=("tone_norm", "sum"),
+            mentions=("mentions", "sum"),
+        )
+        .reset_index()
+    )
+
+
+def build_graph_from_aggregates(
+    aggregates: pd.DataFrame,
+    weight_by: WeightScheme = "frequency",
+) -> nx.DiGraph:
+    """Build the interaction graph from a dyad and event-type aggregate.
+
+    Construction cost is proportional to the number of dyads, not to the
+    number of underlying events, which is what allows a full year of data to
+    be graphed from a single database query.
+
+    Parameters
+    ----------
+    aggregates : pandas.DataFrame
+        Frame carrying :data:`AGGREGATE_COLUMNS`.
     weight_by : {"frequency", "tone", "mentions"}, optional
         Edge weighting scheme.
 
@@ -177,55 +238,68 @@ def build_graph(df: pd.DataFrame, weight_by: WeightScheme = "frequency") -> nx.D
     -------
     networkx.DiGraph
         Directed graph with the documented edge and node attributes. Empty
-        when ``df`` contains no rows.
+        when ``aggregates`` contains no rows.
     """
     graph = nx.DiGraph()
 
-    if df.empty:
-        _log.warning("%s Graph construction received an empty event frame", WARN)
+    if aggregates.empty:
+        _log.warning("%s Graph construction received an empty aggregate", WARN)
         return graph
 
     pair_keys = ["Actor1CountryCode", "Actor2CountryCode"]
 
-    working = df[pair_keys + ["tone_norm", "event_type"]].copy()
-    working["mentions"] = (
-        pd.to_numeric(df["NumMentions"], errors="coerce").fillna(1).astype("int64")
-    )
+    frame = aggregates.copy()
+    frame["num_events"] = frame["num_events"].astype("int64")
+    frame["mentions"] = frame["mentions"].astype("int64")
+    frame["tone_sum"] = frame["tone_sum"].astype("float64")
 
-    aggregated = working.groupby(pair_keys, sort=False).agg(
-        num_events=("tone_norm", "size"),
-        tone_sum=("tone_norm", "sum"),
+    # Event-type histogram per directed dyad. The pivot is the only reshape
+    # needed: every other quantity is a sum over the same grouping.
+    histograms = (
+        frame.pivot_table(
+            index=pair_keys,
+            columns="event_type",
+            values="num_events",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .astype("int64")
+    )
+    totals = frame.groupby(pair_keys, sort=False).agg(
+        num_events=("num_events", "sum"),
+        tone_sum=("tone_sum", "sum"),
         mentions=("mentions", "sum"),
     )
+    histograms = histograms.reindex(totals.index, fill_value=0)
 
-    # Event-type histogram per directed dyad, aligned to the aggregate index.
-    type_matrix = (
-        working.groupby(pair_keys + ["event_type"], sort=False)
-        .size()
-        .unstack(fill_value=0)
-        .reindex(aggregated.index, fill_value=0)
-    )
-    type_labels: list[str] = [str(label) for label in type_matrix.columns]
-
-    conflict_columns = [c for c in type_matrix.columns if c in _CONFLICT_TYPES]
-    coop_columns = [c for c in type_matrix.columns if c in _COOPERATION_TYPES]
+    type_labels: list[str] = [str(label) for label in histograms.columns]
+    conflict_columns = [c for c in histograms.columns if c in _CONFLICT_TYPES]
+    coop_columns = [c for c in histograms.columns if c in _COOPERATION_TYPES]
     conflict_totals = (
-        type_matrix[conflict_columns].sum(axis=1)
+        histograms[conflict_columns].sum(axis=1)
         if conflict_columns
-        else pd.Series(0, index=type_matrix.index)
+        else pd.Series(0, index=histograms.index)
     )
     coop_totals = (
-        type_matrix[coop_columns].sum(axis=1)
+        histograms[coop_columns].sum(axis=1)
         if coop_columns
-        else pd.Series(0, index=type_matrix.index)
+        else pd.Series(0, index=histograms.index)
     )
+    type_counts = histograms.to_numpy()
 
-    type_counts = type_matrix.to_numpy()
+    # Iterate over numpy columns rather than DataFrame rows: iterrows()
+    # materialises a Series per dyad, which dominates construction cost once
+    # the graph runs to tens of thousands of edges.
+    event_totals = totals["num_events"].to_numpy()
+    tone_totals = totals["tone_sum"].to_numpy()
+    mention_totals = totals["mentions"].to_numpy()
+    conflict_values = conflict_totals.to_numpy()
+    coop_values = coop_totals.to_numpy()
 
-    for position, ((source, target), row) in enumerate(aggregated.iterrows()):
-        num_events = int(row["num_events"])
-        avg_tone = float(row["tone_sum"]) / num_events if num_events else 0.0
-        mentions = int(row["mentions"])
+    for position, (source, target) in enumerate(totals.index):
+        num_events = int(event_totals[position])
+        avg_tone = float(tone_totals[position]) / num_events if num_events else 0.0
+        mentions = int(mention_totals[position])
 
         histogram = {
             label: int(count)
@@ -251,8 +325,8 @@ def build_graph(df: pd.DataFrame, weight_by: WeightScheme = "frequency") -> nx.D
             mentions=mentions,
             dominant_type=dominant_type,
             event_types=histogram,
-            conflict_count=int(conflict_totals.iloc[position]),
-            coop_count=int(coop_totals.iloc[position]),
+            conflict_count=int(conflict_values[position]),
+            coop_count=int(coop_values[position]),
         )
 
     for node in graph.nodes():
@@ -268,6 +342,35 @@ def build_graph(df: pd.DataFrame, weight_by: WeightScheme = "frequency") -> nx.D
         OK, graph.number_of_nodes(), graph.number_of_edges(), weight_by,
     )
     return graph
+
+
+def build_graph(df: pd.DataFrame, weight_by: WeightScheme = "frequency") -> nx.DiGraph:
+    """Build a directed weighted graph from preprocessed event data.
+
+    A thin wrapper: the frame is reduced by :func:`aggregate_events` and the
+    result handed to :func:`build_graph_from_aggregates`. Routing both the
+    in-memory and the database path through one builder is what guarantees
+    they cannot drift apart.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Preprocessed events carrying ``Actor1CountryCode``,
+        ``Actor2CountryCode``, ``tone_norm``, ``event_type`` and
+        ``NumMentions``.
+    weight_by : {"frequency", "tone", "mentions"}, optional
+        Edge weighting scheme.
+
+    Returns
+    -------
+    networkx.DiGraph
+        Directed graph with the documented edge and node attributes. Empty
+        when ``df`` contains no rows.
+    """
+    if df.empty:
+        _log.warning("%s Graph construction received an empty event frame", WARN)
+        return nx.DiGraph()
+    return build_graph_from_aggregates(aggregate_events(df), weight_by)
 
 
 def build_temporal_graphs(
@@ -315,6 +418,57 @@ def build_temporal_graphs(
     _log.info(
         "%s Built %d temporal graphs (%s): %s to %s",
         OK, len(graphs), period, periods[0], periods[-1],
+    )
+    return graphs
+
+
+def build_temporal_graphs_from_aggregates(
+    aggregates: pd.DataFrame,
+    weight_by: WeightScheme = "frequency",
+) -> dict[str, nx.DiGraph]:
+    """Build one snapshot graph per period from a period-tagged aggregate.
+
+    The companion to :func:`build_temporal_graphs` for the database path.
+    :meth:`data.store.EventStore.dyad_aggregates` groups by period inside SQL
+    and returns every snapshot in one result set, so the whole temporal series
+    costs a single query rather than one per period.
+
+    Parameters
+    ----------
+    aggregates : pandas.DataFrame
+        Frame carrying :data:`AGGREGATE_COLUMNS` plus a ``period`` column.
+    weight_by : {"frequency", "tone", "mentions"}, optional
+        Edge weighting scheme.
+
+    Returns
+    -------
+    dict of str to networkx.DiGraph
+        Snapshot graphs keyed by period label, empty when ``aggregates`` is.
+
+    Raises
+    ------
+    KeyError
+        When the frame carries no ``period`` column.
+    """
+    if aggregates.empty:
+        _log.warning("%s Temporal slicing received an empty aggregate", WARN)
+        return {}
+
+    if "period" not in aggregates.columns:
+        raise KeyError(
+            "Temporal aggregates must carry a 'period' column; call "
+            "dyad_aggregates(period=...) to produce one"
+        )
+
+    graphs = {
+        str(label): build_graph_from_aggregates(group, weight_by)
+        for label, group in aggregates.groupby("period")
+    }
+
+    periods = sorted(graphs)
+    _log.info(
+        "%s Built %d temporal graphs from aggregates: %s to %s",
+        OK, len(graphs), periods[0], periods[-1],
     )
     return graphs
 

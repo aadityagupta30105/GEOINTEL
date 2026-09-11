@@ -168,7 +168,10 @@ def _filter_bilateral(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[mask].copy()
 
 
-def fetch_gdelt_day(date: datetime, target_rows: int = 2000) -> pd.DataFrame | None:
+def fetch_gdelt_day(
+    date: datetime,
+    target_rows: int | None = 2000,
+) -> pd.DataFrame | None:
     """Download one day of GDELT events and retain state-to-state interactions.
 
     The full file is parsed before filtering because GDELT orders rows by event
@@ -178,14 +181,17 @@ def fetch_gdelt_day(date: datetime, target_rows: int = 2000) -> pd.DataFrame | N
     ----------
     date : datetime
         Day to download.
-    target_rows : int, optional
+    target_rows : int or None, optional
         Upper bound on retained rows. Sampling is seeded for reproducibility.
+        Pass ``None`` (or ``0``) to retain every bilateral event, which is what
+        the year-scale harvester does.
 
     Returns
     -------
     pandas.DataFrame or None
         Bilateral events for the day, or ``None`` when the fetch failed or the
-        export contained no state-to-state events.
+        export contained no state-to-state events. The returned frame carries
+        a ``download_bytes`` attribute in :attr:`pandas.DataFrame.attrs`.
     """
     url = get_gdelt_url(date)
     day = date.strftime("%Y-%m-%d")
@@ -221,8 +227,10 @@ def fetch_gdelt_day(date: datetime, target_rows: int = 2000) -> pd.DataFrame | N
             _log.warning("%s %s: no bilateral events in export", WARN, day)
             return None
 
-        if total > target_rows:
+        if target_rows and total > target_rows:
             bilateral = bilateral.sample(n=target_rows, random_state=_SAMPLE_SEED)
+
+        bilateral.attrs["download_bytes"] = len(raw_bytes)
 
         _log.info(
             "%s %s: %s bilateral events (retaining %s)",
@@ -244,7 +252,7 @@ def fetch_gdelt_day(date: datetime, target_rows: int = 2000) -> pd.DataFrame | N
 def collect_gdelt_range(
     start: datetime,
     end: datetime,
-    target_rows_per_day: int = 2000,
+    target_rows_per_day: int | None = 2000,
 ) -> pd.DataFrame:
     """Collect GDELT events across an inclusive date range.
 
@@ -257,8 +265,9 @@ def collect_gdelt_range(
         First day to collect, inclusive.
     end : datetime
         Last day to collect, inclusive.
-    target_rows_per_day : int, optional
-        Per-day retention cap forwarded to :func:`fetch_gdelt_day`.
+    target_rows_per_day : int or None, optional
+        Per-day retention cap forwarded to :func:`fetch_gdelt_day`. ``None``
+        retains every bilateral event.
 
     Returns
     -------

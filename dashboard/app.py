@@ -22,8 +22,10 @@ Run with::
 
 from __future__ import annotations
 
+import sqlite3
 import sys
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
@@ -36,9 +38,11 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from analysis.graph_builder import (  # noqa: E402
+    AGGREGATE_COLUMNS,
     NetworkStats,
-    build_graph,
-    build_temporal_graphs,
+    aggregate_events,
+    build_graph_from_aggregates,
+    build_temporal_graphs_from_aggregates,
     compute_metrics,
     compute_network_stats,
 )
@@ -59,13 +63,18 @@ from dashboard.theme import (  # noqa: E402
     ACCENT,
     ACCENT_ALT,
     BLOC_COLORS,
+    FONT_DISPLAY,
     GLOBAL_CSS,
+    MUTED,
     NEGATIVE,
+    PANEL_CLIP,
     POSITIVE,
+    SURFACE,
     diverging_gradient,
     sequential_gradient,
     tone_color,
 )
+from data.store import DEFAULT_DB_PATH, EventStore, is_read_only_sql  # noqa: E402
 from utils.logging_config import OK, WARN, get_logger  # noqa: E402
 
 _log = get_logger(__name__)
@@ -79,12 +88,31 @@ _REQUIRED_EXPORT_COLUMNS: Final[frozenset[str]] = frozenset({
 })
 
 _SOURCE_LABELS: Final[dict[str, str]] = {
+    "database": "Event store (SQL)",
     "pipeline_output": "Pipeline export",
     "gdelt_live": "GDELT live fetch",
     "mock": "Synthetic simulation",
 }
 
 _GDELT_LIVE_MAX_DAYS: Final[int] = 7
+
+DB_PATH: Final[Path] = DEFAULT_DB_PATH
+
+# Sentinel used by the event-type selector for "no restriction".
+_ALL_TYPES: Final[str] = "All"
+
+# Row cap applied to SQL console results, so that a careless SELECT cannot
+# pull a multi-million row table into the browser.
+_CONSOLE_ROW_LIMIT: Final[int] = 5000
+
+# Starting point offered in the SQL console. Deliberately unfiltered: a
+# default query that returns nothing on a small store teaches the operator
+# that the console is broken rather than that their predicate was narrow.
+_CONSOLE_DEFAULT_QUERY: Final[str] = """SELECT source, target, num_events,
+       ROUND(tone, 3) AS tone, conflict_count, coop_count
+  FROM v_edges
+ ORDER BY num_events DESC
+ LIMIT 50"""
 
 
 st.set_page_config(
@@ -180,6 +208,166 @@ def load_data(
     return frame, f"Synthetic simulation - {len(frame):,} events"
 
 
+# --- Store-backed acquisition -----------------------------------------------
+#
+# The store path never materialises the event table. Filters are pushed into
+# SQL and only the dyad aggregate crosses into pandas, which is what keeps a
+# full year responsive. Every loader below is keyed on scalars alone so that
+# Streamlit can cache it without hashing a frame.
+
+@st.cache_data(show_spinner=False, ttl=300)
+def store_profile(db_path: str) -> dict[str, object] | None:
+    """Summarise the store so the sidebar can offer sensible defaults.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite store.
+
+    Returns
+    -------
+    dict or None
+        Statistics, event types and country codes, or ``None`` when the store
+        is absent, unreadable or empty.
+    """
+    if not Path(db_path).exists():
+        return None
+    try:
+        with EventStore(db_path, read_only=True) as store:
+            stats = store.stats()
+            if not stats["dyad_rows"]:
+                return None
+            return {
+                "stats": dict(stats),
+                "event_types": store.event_types(),
+                "countries": store.countries(),
+            }
+    except (sqlite3.Error, FileNotFoundError, OSError) as exc:
+        _log.error("Store unreadable at %s: %s", db_path, exc)
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def store_aggregates(
+    db_path: str,
+    start: str,
+    end: str,
+    event_types: tuple[str, ...],
+    countries: tuple[str, ...],
+    period: str = "",
+) -> pd.DataFrame:
+    """Query the dyad aggregate for a window, filtered in SQL.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite store.
+    start, end : str
+        Inclusive window bounds as ``YYYY-MM-DD``.
+    event_types : tuple of str
+        Event-type restriction; empty means no restriction.
+    countries : tuple of str
+        Country restriction; empty means no restriction.
+    period : str, optional
+        Period granularity for temporal snapshots, or ``""`` for a single
+        aggregate over the whole window.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Aggregate frame, empty when the query matched nothing.
+    """
+    with EventStore(db_path, read_only=True) as store:
+        return store.dyad_aggregates(
+            start=start,
+            end=end,
+            event_types=list(event_types) or None,
+            countries=list(countries) or None,
+            period=period or None,
+        )
+
+
+@st.cache_data(show_spinner=False)
+def store_coverage(db_path: str) -> pd.DataFrame:
+    """Read per-month collection coverage from the store.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite store.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Coverage frame, empty when nothing has been harvested.
+    """
+    with EventStore(db_path, read_only=True) as store:
+        return store.coverage()
+
+
+@st.cache_data(show_spinner=False)
+def store_schema(db_path: str) -> pd.DataFrame:
+    """Describe the store's tables and views for the SQL console.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite store.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per column.
+    """
+    with EventStore(db_path, read_only=True) as store:
+        return store.schema()
+
+
+@st.cache_data(show_spinner=False)
+def run_console_query(db_path: str, sql: str) -> tuple[pd.DataFrame, str]:
+    """Execute an operator-supplied query under two independent guards.
+
+    The statement must pass :func:`data.store.is_read_only_sql`, and it runs
+    on a connection opened in SQLite read-only mode. Either guard alone would
+    do; both are cheap, and a write reaching the store from a text box is not
+    a failure worth risking.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite store.
+    sql : str
+        Statement to run.
+
+    Returns
+    -------
+    tuple of (pandas.DataFrame, str)
+        Result rows and a status message. The frame is empty when the
+        statement was rejected or failed.
+    """
+    if not is_read_only_sql(sql):
+        return pd.DataFrame(), (
+            "Rejected: the console accepts a single SELECT or WITH statement."
+        )
+
+    try:
+        with EventStore(db_path, read_only=True) as store:
+            frame = store.query(f"SELECT * FROM ({sql.strip().rstrip(';')}) "
+                                f"LIMIT {_CONSOLE_ROW_LIMIT}")
+    except (sqlite3.Error, pd.errors.DatabaseError) as exc:
+        return pd.DataFrame(), f"SQL error: {exc}"
+
+    if frame.empty:
+        return frame, "The query ran and matched no rows."
+
+    truncated = (
+        f" (truncated to {_CONSOLE_ROW_LIMIT:,})"
+        if len(frame) >= _CONSOLE_ROW_LIMIT
+        else ""
+    )
+    return frame, f"{len(frame):,} row(s){truncated}"
+
+
 def fingerprint(frame: pd.DataFrame) -> str:
     """Compute a content fingerprint for cache invalidation.
 
@@ -205,16 +393,17 @@ def fingerprint(frame: pd.DataFrame) -> str:
 
 @st.cache_resource(show_spinner=False)
 def load_graph(
-    _events: pd.DataFrame,
+    _aggregates: pd.DataFrame,
     cache_key: str,
 ) -> tuple[nx.DiGraph, pd.DataFrame, NetworkStats]:
-    """Build the static graph and its analytics for a filtered event frame.
+    """Build the static graph and its analytics for a dyad aggregate.
 
     Parameters
     ----------
-    _events : pandas.DataFrame
-        Filtered event frame. Excluded from the cache key by the underscore
-        prefix; ``cache_key`` carries the identity instead.
+    _aggregates : pandas.DataFrame
+        Frame carrying :data:`analysis.graph_builder.AGGREGATE_COLUMNS`.
+        Excluded from the cache key by the underscore prefix; ``cache_key``
+        carries the identity instead.
     cache_key : str
         Fingerprint produced by :func:`fingerprint`.
 
@@ -223,33 +412,31 @@ def load_graph(
     tuple of (networkx.DiGraph, pandas.DataFrame, NetworkStats)
         Graph, node metrics and global statistics.
     """
-    graph = build_graph(_events)
+    graph = build_graph_from_aggregates(_aggregates)
     return graph, compute_metrics(graph), compute_network_stats(graph)
 
 
 @st.cache_resource(show_spinner=False)
 def load_temporal(
-    _events: pd.DataFrame,
+    _aggregates: pd.DataFrame,
     cache_key: str,
-    period: str = "month",
 ) -> dict[str, nx.DiGraph]:
-    """Build temporal snapshot graphs for a filtered event frame.
+    """Build temporal snapshot graphs from a period-tagged aggregate.
 
     Parameters
     ----------
-    _events : pandas.DataFrame
-        Filtered event frame, excluded from the cache key.
+    _aggregates : pandas.DataFrame
+        Aggregate frame carrying a ``period`` column, excluded from the cache
+        key.
     cache_key : str
         Fingerprint produced by :func:`fingerprint`.
-    period : {"month", "quarter", "year"}, optional
-        Temporal granularity.
 
     Returns
     -------
     dict of str to networkx.DiGraph
         Snapshot graphs keyed by period label.
     """
-    return build_temporal_graphs(_events, period=period)
+    return build_temporal_graphs_from_aggregates(_aggregates)
 
 
 @st.cache_data(show_spinner=False)
@@ -360,24 +547,288 @@ def metric_card(container: object, value: str, label: str, color: str = ACCENT) 
     )
 
 
-def render_sidebar() -> tuple[pd.DataFrame, str, str, bool]:
-    """Render the sidebar and resolve the active event frame.
+@dataclass(frozen=True, slots=True)
+class Selection:
+    """The active data selection resolved by the sidebar.
+
+    One object describes where the aggregate came from and how it was
+    filtered, which lets :func:`main` stay agnostic about the source. The
+    store path fills ``db_path`` and leaves ``events`` empty; the frame paths
+    do the reverse.
+
+    Attributes
+    ----------
+    source : str
+        Key from :data:`_SOURCE_LABELS`.
+    provenance : str
+        Human-readable description of what was loaded.
+    aggregates : pandas.DataFrame
+        Dyad aggregate over the selected window.
+    temporal : pandas.DataFrame
+        The same aggregate tagged with a ``period`` column.
+    db_path : str
+        Store path, empty for the frame-backed sources.
+    use_llm : bool
+        Whether narrative generation is enabled.
+    """
+
+    source: str
+    provenance: str
+    aggregates: pd.DataFrame
+    temporal: pd.DataFrame
+    db_path: str
+    use_llm: bool
+
+
+def _default_source() -> str:
+    """Choose the source to select on first load.
+
+    The store is preferred when it holds data, then the pipeline export, then
+    synthetic generation. Defaulting to something that does not exist would
+    halt the app on a fresh checkout or a hosted deployment, where neither the
+    store nor the output directory is committed.
 
     Returns
     -------
-    tuple of (pandas.DataFrame, str, str, bool)
-        The loaded frame, its provenance label, the selected event-type filter
-        and whether narrative generation is enabled.
+    str
+        Key from :data:`_SOURCE_LABELS`.
+    """
+    if store_profile(str(DB_PATH)):
+        return "database"
+    return "pipeline_output" if EVENTS_CSV.exists() else "mock"
+
+
+def _render_store_controls(profile: dict[str, object]) -> tuple[
+    pd.DataFrame, pd.DataFrame, str
+]:
+    """Render the store filters and run the resulting queries.
+
+    Every control here maps onto a ``WHERE`` clause rather than onto a pandas
+    mask, so widening the window costs a query and not a reload.
+
+    Parameters
+    ----------
+    profile : dict
+        Store summary from :func:`store_profile`.
+
+    Returns
+    -------
+    tuple of (pandas.DataFrame, pandas.DataFrame, str)
+        The windowed aggregate, the same aggregate tagged by period, and a
+        provenance label.
+    """
+    stats = profile["stats"]
+    first = str(stats["first_date"])
+    last = str(stats["last_date"])
+    lower = date.fromisoformat(first)
+    upper = date.fromisoformat(last)
+
+    st.markdown(
+        f"<div class='status-line'>{OK} {int(stats['events']):,} events &middot; "
+        f"{first} to {last}<br>{int(stats['countries']):,} countries &middot; "
+        f"{int(stats['size_bytes']) / (1024 ** 2):,.0f} MB on disk</div>",
+        unsafe_allow_html=True,
+    )
+
+    window = st.date_input(
+        "Window",
+        value=(lower, upper),
+        min_value=lower,
+        max_value=upper,
+        key="store_window",
+    )
+    # A date_input in range mode returns a one-element tuple mid-edit, between
+    # the first and second click. Hold the previous end date until the second
+    # arrives rather than querying an unintended window.
+    start_date, end_date = window if len(window) == 2 else (window[0], upper)
+
+    available_types = [str(value) for value in profile["event_types"]]
+    chosen_types = st.multiselect(
+        "Event types",
+        options=available_types,
+        default=[],
+        key="store_types",
+        help="Empty means every type.",
+    )
+
+    chosen_countries = st.multiselect(
+        "Countries",
+        options=[str(value) for value in profile["countries"]],
+        default=[],
+        key="store_countries",
+        help="Empty means every country. Matches either side of a dyad.",
+    )
+
+    period = st.selectbox(
+        "Temporal granularity",
+        options=["month", "quarter", "year"],
+        key="store_period",
+    )
+
+    start, end = start_date.isoformat(), end_date.isoformat()
+    types = tuple(chosen_types)
+    countries = tuple(chosen_countries)
+
+    with st.spinner("Querying event store"):
+        aggregates = store_aggregates(str(DB_PATH), start, end, types, countries)
+        temporal = store_aggregates(
+            str(DB_PATH), start, end, types, countries, period=period
+        )
+
+    events = int(aggregates["num_events"].sum()) if not aggregates.empty else 0
+    return aggregates, temporal, (
+        f"Event store - {events:,} events over {start} to {end}"
+    )
+
+
+def _render_frame_controls(source: str) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Render the controls for the frame-backed sources and load them.
+
+    Parameters
+    ----------
+    source : {"pipeline_output", "gdelt_live", "mock"}
+        Selected source.
+
+    Returns
+    -------
+    tuple of (pandas.DataFrame, pandas.DataFrame, str)
+        The aggregate, the period-tagged aggregate, and a provenance label.
+    """
+    n_events, days_back = 5000, 90
+    gdelt_start = gdelt_end = ""
+
+    if source == "mock":
+        n_events = st.slider("Events to simulate", 1000, 10000, 5000, 500)
+        days_back = st.slider("Window (days)", 30, 365, 90, 30)
+    elif source == "gdelt_live":
+        col_from, col_to = st.columns(2)
+        with col_from:
+            gdelt_start = st.date_input(
+                "From",
+                value=datetime.now().date() - timedelta(days=_GDELT_LIVE_MAX_DAYS),
+                key="gdelt_from",
+            ).strftime("%Y-%m-%d")
+        with col_to:
+            gdelt_end = st.date_input(
+                "To", value=datetime.now().date(), key="gdelt_to"
+            ).strftime("%Y-%m-%d")
+        st.markdown(
+            "<div class='status-line'>[WARN] Full daily exports are retrieved. "
+            "Allow roughly five seconds per day. For anything longer than a "
+            "week use <code>python -m data.harvest</code> and read the "
+            "store.</div>",
+            unsafe_allow_html=True,
+        )
+    elif EVENTS_CSV.exists():
+        modified = datetime.fromtimestamp(EVENTS_CSV.stat().st_mtime)
+        st.markdown(
+            f"<div class='status-line'>{OK} events_clean.csv "
+            f"&middot; {modified.strftime('%Y-%m-%d %H:%M')}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"<div class='status-line'>{WARN} events_clean.csv not found. "
+            "Run <code>python main.py</code> to generate it.</div>",
+            unsafe_allow_html=True,
+        )
+
+    with st.spinner("Loading event stream"):
+        events, provenance = load_data(
+            source, n_events, days_back, gdelt_start, gdelt_end
+        )
+
+    if events.empty:
+        st.markdown(
+            f"<div class='status-line'>[ERROR] {provenance}</div>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    selected_type = st.selectbox(
+        "Event type",
+        [_ALL_TYPES, *sorted(events["event_type"].dropna().unique().tolist())],
+        key="event_type_filter",
+    )
+    if selected_type != _ALL_TYPES:
+        events = events[events["event_type"] == selected_type]
+        provenance = f"{provenance} / {selected_type}"
+
+    if events.empty:
+        st.markdown(
+            f"<div class='status-line'>[WARN] No events match "
+            f"'{selected_type}'.</div>",
+            unsafe_allow_html=True,
+        )
+        st.stop()
+
+    period = st.selectbox(
+        "Temporal granularity",
+        options=["month", "quarter", "year"],
+        key="frame_period",
+    )
+
+    aggregates = aggregate_events(events)
+    temporal = _tag_periods(events, period)
+    return aggregates, temporal, provenance
+
+
+def _tag_periods(events: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Aggregate an event frame per period, matching the store's period labels.
+
+    Parameters
+    ----------
+    events : pandas.DataFrame
+        Preprocessed events carrying a parseable ``date`` column.
+    period : {"month", "quarter", "year"}
+        Granularity.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Aggregate carrying an extra ``period`` column, empty when no row has a
+        parseable date.
+    """
+    frame = events.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame = frame[frame["date"].notna()]
+
+    if frame.empty:
+        return pd.DataFrame(columns=["period", *AGGREGATE_COLUMNS])
+
+    if period == "month":
+        labels = frame["date"].dt.to_period("M").astype(str)
+    elif period == "quarter":
+        labels = frame["date"].dt.to_period("Q").astype(str)
+    else:
+        labels = frame["date"].dt.year.astype(str)
+
+    return pd.concat(
+        [
+            aggregate_events(group).assign(period=str(label))
+            for label, group in frame.groupby(labels)
+        ],
+        ignore_index=True,
+    )
+
+
+def render_sidebar() -> Selection:
+    """Render the sidebar and resolve the active data selection.
+
+    Returns
+    -------
+    Selection
+        The loaded aggregates, provenance and narrative setting.
     """
     with st.sidebar:
         section_title("Data source")
 
-        # Prefer the pipeline export, but only when it exists. On a hosted
-        # deployment the output directory is not committed, so defaulting to
-        # it would halt the app on first load; synthetic data keeps the
-        # dashboard usable with no prior pipeline run.
-        source_options = ["pipeline_output", "gdelt_live", "mock"]
-        default_source = "pipeline_output" if EVENTS_CSV.exists() else "mock"
+        profile = store_profile(str(DB_PATH))
+        source_options = [
+            key for key in _SOURCE_LABELS
+            if key != "database" or profile is not None
+        ]
+        default_source = _default_source()
 
         source = st.radio(
             "Source",
@@ -385,60 +836,30 @@ def render_sidebar() -> tuple[pd.DataFrame, str, str, bool]:
             format_func=lambda key: _SOURCE_LABELS[key],
             index=source_options.index(default_source),
             label_visibility="collapsed",
-            help="The pipeline export reads output/events_clean.csv written by main.py",
+            help=(
+                "The event store is the authoritative source. Fill it with "
+                "python -m data.harvest."
+            ),
             key="source",
         )
-
-        n_events, days_back = 5000, 90
-        gdelt_start = gdelt_end = ""
-
-        if source == "mock":
-            n_events = st.slider("Events to simulate", 1000, 10000, 5000, 500)
-            days_back = st.slider("Window (days)", 30, 365, 90, 30)
-        elif source == "gdelt_live":
-            col_from, col_to = st.columns(2)
-            with col_from:
-                gdelt_start = st.date_input(
-                    "From",
-                    value=datetime.now().date() - timedelta(days=_GDELT_LIVE_MAX_DAYS),
-                    key="gdelt_from",
-                ).strftime("%Y-%m-%d")
-            with col_to:
-                gdelt_end = st.date_input(
-                    "To", value=datetime.now().date(), key="gdelt_to"
-                ).strftime("%Y-%m-%d")
-            st.markdown(
-                "<div class='status-line'>[WARN] Full daily exports are retrieved. "
-                "Allow roughly five seconds per day.</div>",
-                unsafe_allow_html=True,
-            )
-        elif EVENTS_CSV.exists():
-            modified = datetime.fromtimestamp(EVENTS_CSV.stat().st_mtime)
-            st.markdown(
-                f"<div class='status-line'>{OK} events_clean.csv "
-                f"&middot; {modified.strftime('%Y-%m-%d %H:%M')}</div>",
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                f"<div class='status-line'>{WARN} events_clean.csv not found. "
-                "Run <code>python main.py</code> to generate it.</div>",
-                unsafe_allow_html=True,
-            )
 
         if st.button("Reload data", use_container_width=True):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
 
-        with st.spinner("Loading event stream"):
-            events, provenance = load_data(
-                source, n_events, days_back, gdelt_start, gdelt_end
-            )
+        st.markdown("---")
+        section_title("Filters")
 
-        if events.empty:
+        if source == "database" and profile is not None:
+            aggregates, temporal, provenance = _render_store_controls(profile)
+        else:
+            aggregates, temporal, provenance = _render_frame_controls(source)
+
+        if aggregates.empty:
             st.markdown(
-                f"<div class='status-line'>[ERROR] {provenance}</div>",
+                f"<div class='status-line'>[WARN] {provenance} matched no "
+                "events. Widen the filters.</div>",
                 unsafe_allow_html=True,
             )
             st.stop()
@@ -447,11 +868,6 @@ def render_sidebar() -> tuple[pd.DataFrame, str, str, bool]:
             f"<div class='status-line'>{OK} {provenance}</div>",
             unsafe_allow_html=True,
         )
-
-        st.markdown("---")
-        section_title("Filters")
-        event_types = ["All", *sorted(events["event_type"].dropna().unique().tolist())]
-        selected_type = st.selectbox("Event type", event_types, key="event_type_filter")
 
         st.markdown("---")
         section_title("Narratives")
@@ -467,14 +883,19 @@ def render_sidebar() -> tuple[pd.DataFrame, str, str, bool]:
 
         st.markdown("---")
         st.markdown(
-            "<div class='status-line'>Engine: NetworkX + DistilBERT<br>"
-            "GeoIntel pipeline v1.1</div>",
+            "<div class='status-line'>Engine: NetworkX + SQLite<br>"
+            "GeoIntel pipeline v1.2</div>",
             unsafe_allow_html=True,
         )
 
-    return events, provenance, selected_type, use_llm
-
-
+    return Selection(
+        source=source,
+        provenance=provenance,
+        aggregates=aggregates,
+        temporal=temporal,
+        db_path=str(DB_PATH) if source == "database" else "",
+        use_llm=use_llm,
+    )
 def render_kpi_strip(stats: NetworkStats) -> None:
     """Render the global KPI strip.
 
@@ -602,10 +1023,11 @@ def render_network_tab(
         with bloc_columns[index]:
             st.markdown(
                 f"<div style='border-left:3px solid {color};padding:10px 14px;"
-                f"background:rgba(17,24,39,0.8);border-radius:3px'>"
+                f"background:{SURFACE};clip-path:{PANEL_CLIP}'>"
                 f"<div style='color:{color};font-weight:700;font-size:0.95rem;"
-                f"font-family:Syne,sans-serif'>{pole} bloc</div>"
-                f"<div style='color:#94a3b8;font-size:0.72rem;margin:2px 0 8px 0'>"
+                f"font-family:{FONT_DISPLAY};letter-spacing:0.1em;"
+                f"text-transform:uppercase'>{pole} bloc</div>"
+                f"<div style='color:{MUTED};font-size:0.72rem;margin:2px 0 8px 0'>"
                 f"{len(members)} countries</div>{pills}</div>",
                 unsafe_allow_html=True,
             )
@@ -847,7 +1269,7 @@ def render_overview_tab(
             )
             st.markdown(
                 f"<div style='margin:10px 0;'>"
-                f"<div style='color:#64748b;font-size:0.68rem;letter-spacing:0.12em;"
+                f"<div style='color:{MUTED};font-size:0.68rem;letter-spacing:0.16em;"
                 f"text-transform:uppercase;margin-bottom:4px;'>"
                 f"Bloc {index + 1} &middot; {len(members)} countries</div>{tags}</div>",
                 unsafe_allow_html=True,
@@ -864,34 +1286,101 @@ def render_overview_tab(
         )
 
 
+def render_query_tab(db_path: str) -> None:
+    """Render the SQL console over the event store.
+
+    The rest of the dashboard answers the questions it was built to answer.
+    This tab exists so the operator can ask one it was not: the schema is on
+    screen, the query box is free-form, and the result is exportable. Both
+    guards described in :func:`run_console_query` apply.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the SQLite store.
+    """
+    section_title(
+        "SQL console",
+        "Read-only. A single SELECT or WITH statement runs against the store; "
+        f"results are capped at {_CONSOLE_ROW_LIMIT:,} rows.",
+    )
+
+    schema = store_schema(db_path)
+    coverage = store_coverage(db_path)
+
+    editor_column, schema_column = st.columns([3, 2])
+
+    with schema_column:
+        st.markdown(
+            "<div class='section-note' style='margin-left:0'>Schema</div>",
+            unsafe_allow_html=True,
+        )
+        for name, columns in schema.groupby("object", sort=False):
+            kind = str(columns["kind"].iloc[0])
+            fields = ", ".join(str(value) for value in columns["column"])
+            st.markdown(
+                f"<div style='margin-bottom:9px'>"
+                f"<span class='tag'>{kind}</span> "
+                f"<span style='color:{ACCENT};font-weight:600'>{name}</span>"
+                f"<div class='status-line' style='margin-top:3px'>{fields}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+    with editor_column:
+        query = st.text_area(
+            "Query",
+            value=_CONSOLE_DEFAULT_QUERY,
+            height=200,
+            key="console_sql",
+            label_visibility="collapsed",
+        )
+        run = st.button("Run query", type="primary", key="console_run")
+
+    if not run:
+        return
+
+    with st.spinner("Executing"):
+        result, message = run_console_query(db_path, query)
+
+    if result.empty:
+        st.markdown(
+            f"<div class='status-line'>[WARN] {message}</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f"<div class='status-line'>{OK} {message}</div>", unsafe_allow_html=True
+    )
+    st.dataframe(result, use_container_width=True, height=420)
+    st.download_button(
+        "Download CSV",
+        data=result.to_csv(index=False).encode("utf-8"),
+        file_name="geointel_query.csv",
+        mime="text/csv",
+        key="console_download",
+    )
+
+    if not coverage.empty:
+        with st.expander("Collection coverage by month", expanded=False):
+            st.dataframe(coverage, use_container_width=True)
+
+
 def main() -> None:
     """Compose and render the dashboard."""
     masthead()
 
-    events, _provenance, selected_type, use_llm = render_sidebar()
-
-    filtered = (
-        events if selected_type == "All"
-        else events[events["event_type"] == selected_type]
-    )
-
-    if filtered.empty:
-        st.markdown(
-            f"<div class='status-line'>[WARN] No events match the filter "
-            f"'{selected_type}'.</div>",
-            unsafe_allow_html=True,
-        )
-        st.stop()
-
-    cache_key = fingerprint(filtered)
+    selection = render_sidebar()
+    cache_key = fingerprint(selection.aggregates)
 
     with st.spinner("Building geopolitical network"):
-        graph, metrics, stats = load_graph(filtered, cache_key)
+        graph, metrics, stats = load_graph(selection.aggregates, cache_key)
 
     if graph.number_of_nodes() == 0:
         st.markdown(
-            "<div class='status-line'>[WARN] The filtered event stream produced "
-            "an empty network.</div>",
+            "<div class='status-line'>[WARN] The selection produced an empty "
+            "network. Widen the window or clear a filter.</div>",
             unsafe_allow_html=True,
         )
         st.stop()
@@ -899,26 +1388,33 @@ def main() -> None:
     render_kpi_strip(stats)
     st.markdown("<br>", unsafe_allow_html=True)
 
-    tabs = st.tabs([
+    labels = [
         "Network graph",
         "Influence rankings",
         "Bilateral analysis",
         "Temporal trends",
         "Network overview",
-    ])
+    ]
+    if selection.db_path:
+        labels.append("SQL console")
+
+    tabs = st.tabs(labels)
 
     with tabs[0]:
         render_network_tab(graph, metrics, stats)
     with tabs[1]:
         render_rankings_tab(metrics)
     with tabs[2]:
-        render_bilateral_tab(graph, use_llm)
+        render_bilateral_tab(graph, selection.use_llm)
     with tabs[3]:
         with st.spinner("Building temporal snapshots"):
-            temporal = load_temporal(filtered, cache_key)
+            temporal = load_temporal(selection.temporal, f"{cache_key}-temporal")
         render_temporal_tab(temporal, cache_key)
     with tabs[4]:
-        render_overview_tab(graph, metrics, stats, use_llm)
+        render_overview_tab(graph, metrics, stats, selection.use_llm)
+    if selection.db_path:
+        with tabs[5]:
+            render_query_tab(selection.db_path)
 
 
 if __name__ == "__main__":

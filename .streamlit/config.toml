@@ -1,0 +1,23 @@
+# Streamlit chrome.
+#
+# The stylesheet in dashboard/theme.py styles everything the application
+# renders, but Streamlit paints its own frame before that stylesheet loads:
+# the top toolbar, the sidebar collapse control, spinners, the running-man
+# indicator and the widget defaults. Without these values the frame flashes
+# Streamlit red on white for a beat on every rerun.
+#
+# Keep in step with dashboard/theme.py. The test suite asserts they agree.
+
+[theme]
+base = "dark"
+primaryColor = "#c9a227"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#0b0b0b"
+textColor = "#f2f2f2"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false

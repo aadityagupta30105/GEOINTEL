@@ -268,9 +268,12 @@ class TestTableShading:
         assert _alpha_of(low) < _alpha_of(high)
 
     def test_sequential_gradient_uses_the_requested_colour(self) -> None:
-        from dashboard.theme import NEGATIVE, sequential_gradient
+        # Derived from the palette rather than pinned to a literal: the test
+        # asserts that the requested colour is the one shaded, which is the
+        # actual contract, and survives a palette change.
+        from dashboard.theme import NEGATIVE, rgba, sequential_gradient
 
-        assert "rgba(239,68,68" in sequential_gradient([1.0, 2.0], NEGATIVE)[1]
+        assert rgba(NEGATIVE, 0.52) in sequential_gradient([1.0, 2.0], NEGATIVE)[1]
 
     def test_sequential_gradient_handles_a_constant_column(self) -> None:
         from dashboard.theme import ACCENT, sequential_gradient
@@ -285,11 +288,11 @@ class TestTableShading:
         assert sequential_gradient([float("nan")], ACCENT) == [""]
 
     def test_diverging_gradient_splits_on_sign(self) -> None:
-        from dashboard.theme import diverging_gradient
+        from dashboard.theme import NEGATIVE, POSITIVE, diverging_gradient, rgba
 
         negative, _, positive = diverging_gradient([-0.8, 0.0, 0.8])
-        assert "rgba(239,68,68" in negative
-        assert "rgba(34,197,94" in positive
+        assert rgba(NEGATIVE, 0.52) in negative
+        assert rgba(POSITIVE, 0.52) in positive
 
     def test_diverging_gradient_intensity_tracks_distance(self) -> None:
         from dashboard.theme import diverging_gradient
